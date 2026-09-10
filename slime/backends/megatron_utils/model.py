@@ -29,6 +29,7 @@ try:
 except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.utils import logging_utils
+from slime.utils.env_pack import ENV_LOSS_BATCH_KEYS
 from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -427,6 +428,9 @@ def forward_only(
             "labels": None,
             "packed_seq_params": packed_seq_params,
             "loss_mask": batch["full_loss_masks"],
+            # See the train forward_step below: keep Float16Module from
+            # upcasting [T, V] logits to fp32 (2026-08-27 OOM fix).
+            "fp32_output": False,
         }
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
@@ -593,6 +597,7 @@ def train_one_step(
                     "rollout_log_probs",
                     "teacher_log_probs",
                     "rollout_mask_sums",
+                    *ENV_LOSS_BATCH_KEYS,
                     # Only present when dumping train debug data; lets the loss
                     # snapshot each sample's log_probs keyed by rollout position.
                     *(["partition"] if args.save_debug_train_data is not None else []),
@@ -625,6 +630,12 @@ def train_one_step(
                 "labels": None,
                 "packed_seq_params": batch["packed_seq_params"],
                 "loss_mask": batch["full_loss_masks"],
+                # Keep Float16Module from upcasting [T, V] logits to fp32
+                # (2026-08-27 OOM fix): megatron Float16Module.forward defaults
+                # fp32_output=True, which doubles logits AND logits-grad memory
+                # (30+ GiB each at 32k x 248320 vocab). The loss path handles
+                # bf16 logits (per-chunk fp32 upcast is bit-exact).
+                "fp32_output": False,
             }
 
             if batch["multimodal_train_inputs"] is not None:

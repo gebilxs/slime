@@ -83,6 +83,12 @@ def _try_load_glm4v_processor(name_or_path: str, **kwargs):
 
 
 def load_processor(name_or_path: str, **kwargs):
+    # Text-only override (manual_slime): when training text-only on a multimodal
+    # checkpoint (e.g. Qwen3.5-4B), force processor=None so the dataset keeps
+    # raw string prompts instead of demanding message lists.
+    import os
+    if os.environ.get("TEXT_ONLY", os.environ.get("ECHO_TEXT_ONLY", "0")) == "1":
+        return None
     try:
         proc = AutoProcessor.from_pretrained(name_or_path, **kwargs)
     except (OSError, ValueError) as e:

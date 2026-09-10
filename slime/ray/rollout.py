@@ -27,6 +27,7 @@ from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_inf
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
+from slime.utils.env_pack import ENV_LOSS_BATCH_KEYS, pack_world_loss_fields
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
@@ -41,11 +42,16 @@ logger = logging.getLogger(__name__)
 _ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": torch.long,
     "loss_masks": torch.int,
+    "world_loss_masks": torch.int,
+    "echo_full_obs_counts": torch.float32,
     "rollout_log_probs": torch.float32,
     "rollout_top_p_token_ids": torch.int32,
     "rollout_top_p_token_offsets": torch.int32,
     "teacher_log_probs": torch.float32,
     "rollout_routed_experts": None,
+    # ECHO turn-level GRPO (protocols.echo_xml.turn_adv): per-token advantages,
+    # one response-length list per sample. Present only when ECHO_TURN_ADV=1.
+    "turn_token_advantages": torch.float32,
 }
 
 _SGLANG_REQUEST_PERF_FIELDS = (
@@ -250,6 +256,15 @@ class ServerGroup:
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
                 }.items()
             }
+            from slime.backends.sglang_utils.qwen35_hf_config import sglang_pythonpath
+
+            _hook = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "backends",
+                "sglang_utils",
+                "runtime_hooks",
+            )
+            env_vars["PYTHONPATH"] = sglang_pythonpath(hook_dir=_hook)
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
                 num_gpus=num_gpus,
@@ -796,6 +811,10 @@ class RolloutManager:
             loss_masks.append(sample.loss_mask)
         train_data["loss_masks"] = loss_masks
 
+        packed_env = pack_world_loss_fields(samples)
+        if packed_env:
+            train_data.update(packed_env)
+
         # Per-rollout aggregate, precomputed at the step level (where we can
         # see every sample of every rollout) and broadcast per-sample so the
         # per-mb loss reducer uses the correct whole-rollout denominator even
@@ -904,6 +923,7 @@ class RolloutManager:
                 "rewards",
                 "truncated",
                 "loss_masks",
+                *ENV_LOSS_BATCH_KEYS,
                 "round_number",
                 "sample_indices",
                 "rollout_ids",
@@ -915,6 +935,9 @@ class RolloutManager:
                 "source_names",
                 "prompt",
                 "teacher_log_probs",
+                # ECHO turn-level GRPO (protocols.echo_xml.turn_adv); only in
+                # data when ECHO_TURN_ADV=1, so the default path is untouched.
+                "turn_token_advantages",
             ]:
                 if key not in data:
                     continue

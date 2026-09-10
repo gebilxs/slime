@@ -196,6 +196,11 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
         with_entropy_grad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with_entropy_grad = with_entropy and with_entropy_grad
+        # Record the incoming logits dtype (bf16 after the 2026-08-27 OOM fix):
+        # backward casts the fp32 chunk grad back to it — bit-identical to the
+        # old fp32-outer-logits path, where the .float() node's backward also
+        # cast the full [T, V] fp32 grad down to bf16.
+        ctx.logits_dtype = vocab_parallel_logits.dtype
         vocab_parallel_logits = vocab_parallel_logits.float()
         seq_len, vocab_parallel_size = vocab_parallel_logits.shape
         rank, _world_size = _get_vocab_parallel_rank_size(process_group)
@@ -285,8 +290,11 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
             sum_softmax_times_logits if with_entropy_grad else vocab_parallel_logits.new_empty((0,))
         )
         saved_logits = vocab_parallel_logits if with_entropy_grad else vocab_parallel_logits.new_empty((0,))
+        # Save the softmax in bf16 (upcast back to fp32 at the start of backward):
+        # halves the per-chunk [T, V] saved-for-backward memory, which otherwise
+        # OOMs on 248k-vocab models with near-full-context (~32k-token) samples.
         ctx.save_for_backward(
-            log_prob_softmax,
+            log_prob_softmax.to(torch.bfloat16),
             target_mask,
             masked_target_1d,
             saved_entropy_softmax,
@@ -307,6 +315,10 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
             sum_softmax_times_logits,
             vocab_parallel_logits,
         ) = ctx.saved_tensors
+
+        # Softmax was saved in bf16 (memory); restore fp32 so all backward math
+        # below is bit-identical to the unpatched implementation.
+        log_prob_softmax = log_prob_softmax.float()
 
         if grad_log_prob is None:
             raise RuntimeError(
@@ -333,7 +345,11 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
         if grad_entropy_input is not None:
             grad_input.add_(grad_entropy_input)
 
-        return grad_input, None, None, None, None, None
+        # Cast back to the incoming logits dtype (bf16 after the 2026-08-27 OOM
+        # fix): same fp32->bf16 rounding the old .float() node's backward applied
+        # to the full [T, V] grad, but done per 2048-token chunk (no 30+ GiB
+        # fp32 grad materialization).
+        return grad_input.to(ctx.logits_dtype), None, None, None, None, None
 
 
 def _calculate_log_probs_and_entropy_chunk(

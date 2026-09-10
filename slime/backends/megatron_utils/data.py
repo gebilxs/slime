@@ -281,6 +281,8 @@ def log_rollout_data(
                 "tokens",
                 "multimodal_train_inputs",
                 "loss_masks",
+                "world_loss_masks",
+                "echo_full_obs_counts",
                 "sample_indices",
                 "rollout_ids",
                 "rollout_mask_sums",

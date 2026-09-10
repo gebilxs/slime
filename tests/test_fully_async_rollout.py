@@ -93,12 +93,55 @@ def test_rollout_takes_target_groups_and_leaves_surplus_queued(monkeypatch):
     args = SimpleNamespace(rollout_global_dataset=True, rollout_batch_size=4)
     out = asyncio.run(fa._generate_rollout_async(args, rollout_id=0, data_buffer=None))
 
-    assert len(out) == 4
+    assert len(out.samples) == 4
     # FIFO: the oldest four groups ship first.
-    assert [group[0].index for group in out] == [0, 1, 2, 3]
+    assert [group[0].index for group in out.samples] == [0, 1, 2, 3]
+    # No seq_length on args → overlong drop disabled, all metrics zero.
+    assert out.metrics["mini/reject_overlong_rate"] == 0.0
+    assert out.metrics["mini/reject_overlong_groups"] == 0.0
+    assert out.metrics["mini/reject_overlong_samples"] == 0.0
     # The other six are still queued for the next rollout, not thrown away.
     assert worker.queue_size() == 6
     assert [gid for gid, _ in worker.get_completed_groups()] == [4, 5, 6, 7, 8, 9]
+
+
+@pytest.mark.unit
+def test_overlong_group_dropped_and_replaced(monkeypatch):
+    """A group with any sample longer than args.seq_length is dropped
+    wholesale; the freed slot pulls the next queued group instead."""
+    worker = _make_worker(monkeypatch)
+    for gid in range(5):
+        group = _make_group(gid)
+        if gid == 1:
+            group[0].tokens = [0] * 101  # overlong vs seq_length=100
+        worker.output_queue.put((gid, group))
+    monkeypatch.setattr(fa, "_get_global_worker", lambda args, data_buffer: worker)
+
+    args = SimpleNamespace(rollout_global_dataset=True, rollout_batch_size=4, seq_length=100)
+    out = asyncio.run(fa._generate_rollout_async(args, rollout_id=0, data_buffer=None))
+
+    assert [group[0].index for group in out.samples] == [0, 2, 3, 4]
+    assert worker.queue_size() == 0
+    assert out.metrics["mini/reject_overlong_groups"] == 1.0
+    assert out.metrics["mini/reject_overlong_samples"] == 1.0
+    assert out.metrics["mini/reject_overlong_rate"] == pytest.approx(1 / 5)
+
+
+@pytest.mark.unit
+def test_overlong_boundary_kept(monkeypatch):
+    """Exactly-at-cap samples train fine; only > seq_length is dropped."""
+    worker = _make_worker(monkeypatch)
+    for gid in range(4):
+        group = _make_group(gid)
+        group[0].tokens = [0] * 100  # at cap, keep
+        worker.output_queue.put((gid, group))
+    monkeypatch.setattr(fa, "_get_global_worker", lambda args, data_buffer: worker)
+
+    args = SimpleNamespace(rollout_global_dataset=True, rollout_batch_size=4, seq_length=100)
+    out = asyncio.run(fa._generate_rollout_async(args, rollout_id=0, data_buffer=None))
+
+    assert [group[0].index for group in out.samples] == [0, 1, 2, 3]
+    assert out.metrics["mini/reject_overlong_rate"] == 0.0
 
 
 @pytest.mark.unit

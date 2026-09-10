@@ -452,6 +452,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std_with_fallback`."
                 ),
             )
+            parser.add_argument(
+                "--fa-reject-zero-std",
+                action="store_true",
+                default=False,
+                help=(
+                    "Fully-async rollout (slime.rollout.fully_async_rollout) only: drop groups whose "
+                    "in-group reward std is zero (all-correct / all-wrong) at collection time and let "
+                    "the async worker pull replacement prompts from the data buffer until "
+                    "rollout_batch_size usable groups are collected. "
+                    "Equivalent to setting the SLIME_FA_REJECT_ZERO_STD=1 env var."
+                ),
+            )
+            parser.add_argument(
+                "--fa-reject-oversample",
+                type=float,
+                default=None,
+                help=(
+                    "Oversample factor bounding --fa-reject-zero-std: per rollout at most "
+                    "ceil(rollout_batch_size * fa_reject_oversample) - rollout_batch_size zero-std "
+                    "groups are dropped, then degenerate groups are accepted again so the rollout "
+                    "always terminates. Defaults to 2.0. SLIME_FA_REJECT_OVERSAMPLE must agree when "
+                    "both are set."
+                ),
+            )
 
             # partial rollout
             parser.add_argument(
@@ -999,6 +1023,32 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Interval (in rollout steps) to update ref model from actor. If None, ref model is not updated.",
             )
             parser.add_argument("--entropy-coef", type=float, default=0.0, help="Entropy loss coef")
+            parser.add_argument(
+                "--env-coeff",
+                "--echo-coeff",
+                dest="env_coeff",
+                type=float,
+                default=0.0,
+                help=(
+                    "ECHO (arXiv:2605.24517) environment-prediction CE coefficient λ. "
+                    "0 disables. Paper default is 0.05. Requires samples to carry "
+                    "world_loss_mask. --echo-coeff is an alias."
+                ),
+            )
+            parser.add_argument(
+                "--echo-world-loss-target",
+                type=str,
+                default="env_only",
+                choices=["full_observation", "env_only", "warning_only", "warning_plus_env"],
+                help="Which observation tokens get L_Env (mirrors echo-rl world_loss_target).",
+            )
+            parser.add_argument(
+                "--echo-loss-normalization",
+                type=str,
+                default="full_observation_tokens",
+                choices=["full_observation_tokens", "token_mean"],
+                help="L_Env normalization. Paper uses full_observation_tokens (Z=|O|).",
+            )
             parser.add_argument("--gamma", type=float, default=1.0, help="PPO GAE gamma")
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
             parser.add_argument("--normalize-advantages", action="store_true", default=False)

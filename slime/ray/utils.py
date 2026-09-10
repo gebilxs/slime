@@ -39,7 +39,20 @@ RAY_DEFAULT_ENV_VARS = {
 
 
 def add_default_ray_env_vars(env_vars: dict[str, str] | None = None) -> dict[str, str]:
-    return RAY_DEFAULT_ENV_VARS | (env_vars or {})
+    # Cross-node SGLang actors only see actor-level env_vars, not the job
+    # driver's full environment. Qwen3.5 needs the tf515 overlay + TEXT_ONLY
+    # on every engine (pod transformers 4.57 does not know qwen3_5 / qwen3_5_moe).
+    inherited = {
+        key: os.environ[key]
+        for key in (
+            "PYTHONPATH",
+            "TEXT_ONLY",
+            "HF_HUB_OFFLINE",
+            "TRANSFORMERS_OFFLINE",
+        )
+        if os.environ.get(key)
+    }
+    return RAY_DEFAULT_ENV_VARS | inherited | (env_vars or {})
 
 
 def ray_noset_visible_devices(env_vars=os.environ):

@@ -83,7 +83,12 @@ class LinearForLastLayer(torch.nn.Linear):
         runtime_gather_output: bool | None = None,
     ) -> tuple[torch.Tensor, None]:
         logits = super().forward(input_)
-        logits = logits.float()
+        # Keep the outer [T, V] logits in bf16 end-to-end (2026-08-27, OOM fix):
+        # the fp32 copy doubled forward logits AND backward logits-grad memory
+        # (32.5 GiB each at 32k tokens x 248320 vocab) and OOMed H200-140G on
+        # near-full-context samples. The PG loss path (_VocabParallelLogProbEntropy)
+        # upcasts each 2048-token chunk to fp32 internally, so log-prob numerics
+        # are unchanged (upcast of the same bf16 GEMM output is bit-exact).
         if self.sequence_parallel:
             logits = tensor_parallel.gather_from_sequence_parallel_region(logits, tensor_parallel_output_grad=False)
         return logits, None

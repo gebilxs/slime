@@ -68,4 +68,5 @@ markers = [
     "docs: mark tests related to documentation (deselect with '-m \"not docs\"')",
     "skipduringci: marks tests that are skipped ci as they are addressed by Jenkins jobs but should be run to test user setups",
     "pleasefixme: marks tests that are broken and need fixing",
+    "gpu: marks tests that need CUDA (deselect with '-m \"not gpu\"')",
 ]

@@ -117,6 +117,8 @@ class Sample:
     label: str | None = None
     reward: float | dict[str, Any] | None = None
     loss_mask: list[int] | None = None
+    world_loss_mask: list[int] | None = None
+    echo_full_obs_count: int | None = None
     weight_versions: list[str] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     # Ragged top-p nucleus token ids replayed from rollout sampling. For response
@@ -257,6 +259,7 @@ class Sample:
         tokens=None,
         log_probs=None,
         trainable: bool = True,
+        world_mask: bool = False,
         meta_info: dict | None = None,
         text: str | None = None,
         update_terminal_info: bool = True,
@@ -279,6 +282,8 @@ class Sample:
             if log_probs is not None:
                 raise ValueError("non-trainable response tokens should not pass rollout log probabilities.")
             log_probs = [0.0] * len(tokens)
+        if trainable and world_mask:
+            raise ValueError("ECHO world_mask cannot be True on trainable (assistant) tokens.")
 
         if text is not None:
             self.response += text
@@ -290,6 +295,10 @@ class Sample:
             if self.loss_mask is None:
                 self.loss_mask = [1] * previous_response_length
             self.loss_mask += [1 if trainable else 0] * len(tokens)
+            if self.world_loss_mask is not None or world_mask:
+                if self.world_loss_mask is None:
+                    self.world_loss_mask = [0] * previous_response_length
+                self.world_loss_mask += [1 if world_mask else 0] * len(tokens)
 
         if log_probs is not None:
             if self.rollout_log_probs is None:
@@ -418,6 +427,11 @@ class Sample:
     def _validate_response_metadata_lengths(self):
         if self.loss_mask is not None and len(self.loss_mask) != self.response_length:
             raise ValueError(f"loss_mask length {len(self.loss_mask)} != response_length {self.response_length}")
+
+        if self.world_loss_mask is not None and len(self.world_loss_mask) != self.response_length:
+            raise ValueError(
+                f"world_loss_mask length {len(self.world_loss_mask)} != response_length {self.response_length}"
+            )
 
         if self.rollout_log_probs is not None and len(self.rollout_log_probs) != self.response_length:
             raise ValueError(

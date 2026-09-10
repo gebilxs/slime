@@ -125,6 +125,12 @@ def _hf_validate_args(args, hf_config):
         if hf_config_name == "intermediate_size" and not validate_dense_ffn:
             continue
 
+        # Dense models (no --num-experts): megatron moe_* args stay None, and a
+        # spurious moe_* attribute on the hf config object (e.g. a config-class
+        # default, as seen with Qwen3.5 dense ckpts) must not trip the check.
+        if megatron_config_name.startswith("moe_") and getattr(args, megatron_config_name, None) is None:
+            continue
+
         if hasattr(hf_config, hf_config_name) and hasattr(args, megatron_config_name):
             if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
                 errors.append(

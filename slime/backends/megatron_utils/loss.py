@@ -9,6 +9,7 @@ from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
+from slime.utils.env_loss import apply_env_loss
 from slime.utils.misc import load_function
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
@@ -125,7 +126,9 @@ def get_responses(
         `[R, V]` (policy) or `[R, 1]` (value) and `tokens_chunk` is shape `[R]`
         (1D int64), both aligned to response tokens for one sample.
     """
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    # bf16 outer logits are supported (2026-08-27 OOM fix): the chunked
+    # log-prob path upcasts each chunk to fp32 internally, bit-exact.
+    assert logits.dtype in (torch.float32, torch.bfloat16), f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
     assert logits.size(0) == 1, f"{logits.shape}"
     logits = logits.squeeze(0)
@@ -532,15 +535,19 @@ def get_log_probs_and_entropy(
     log-probabilities; entropy is always computed from the unmasked logits.
     """
     assert non_loss_data
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    # bf16 outer logits are supported (2026-08-27 OOM fix): the chunked
+    # log-prob path upcasts each chunk to fp32 internally, bit-exact.
+    assert logits.dtype in (torch.float32, torch.bfloat16), f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
     assert logits.size(0) == 1, f"{logits.shape}"
     logits = logits.squeeze(0)
 
     # Apply rollout temperature scaling to logits to match rollout-time log-probs.
+    # In-place: avoids a second full-size fp32 [T, V] copy (tens of GiB at 32k
+    # tokens on 248k-vocab models); nothing upstream saves the pre-scaled value.
     rollout_temperature = getattr(args, "rollout_temperature", 1.0)
     if rollout_temperature != 1.0:
-        logits = logits / rollout_temperature
+        logits.div_(rollout_temperature)
     logits = logits.contiguous()
     T = logits.size(0)
     device = logits.device
@@ -1129,6 +1136,20 @@ def policy_loss_function(
 
         loss = loss + args.kl_loss_coef * kl_loss
 
+    # Additive L_Env on observation tokens (orthogonal to the GRPO mask).
+    # 0805 Megatron train get_batch omitted world_loss_masks, so this term
+    # never reached the GPU; batch keys are in model.py via ENV_LOSS_BATCH_KEYS.
+    slice_cp = slice_log_prob_with_cp if mpu.get_context_parallel_world_size() > 1 else None
+    loss, env_metrics = apply_env_loss(
+        loss,
+        log_probs,
+        batch,
+        args,
+        slice_cp=slice_cp,
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+    )
+
     # make sure the gradient could backprop correctly.
     if log_probs.numel() == 0:
         loss += 0 * logits.sum()
@@ -1146,6 +1167,10 @@ def policy_loss_function(
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }
+    for key, value in env_metrics.items():
+        if value is None:
+            continue
+        reported_loss[key] = value.clone().detach() if torch.is_tensor(value) else value
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()

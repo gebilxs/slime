@@ -260,6 +260,15 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_data["loss_masks"] = [
             t.to(device=device, dtype=torch.int, non_blocking=True) for t in rollout_data["loss_masks"]
         ]
+        if "world_loss_masks" in rollout_data:
+            rollout_data["world_loss_masks"] = [
+                t.to(device=device, dtype=torch.int, non_blocking=True) for t in rollout_data["world_loss_masks"]
+            ]
+        if "echo_full_obs_counts" in rollout_data:
+            rollout_data["echo_full_obs_counts"] = [
+                t.to(device=device, dtype=torch.float32, non_blocking=True)
+                for t in rollout_data["echo_full_obs_counts"]
+            ]
         if "rollout_mask_sums" in rollout_data:
             # Promote precomputed per-rollout mask totals to GPU tensors here
             # (matching loss_masks) so the loss reducer can just divide.

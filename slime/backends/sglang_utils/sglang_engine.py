@@ -11,10 +11,14 @@ from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
 
 from slime.backends.sglang_utils.external import get_server_info
+from slime.backends.sglang_utils.qwen35_hf_config import patch_sglang_hf_text_config, sglang_pythonpath
 from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
+
+_SGLANG_RUNTIME_HOOKS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_hooks")
+patch_sglang_hf_text_config()
 
 
 def get_base_gpu_id(args, rank):
@@ -51,6 +55,8 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     # The rollout Ray actor inherits the job environment, so remove the option
     # before spawning every SGLang server and its children.
     os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    # Scheduler children must not see the TF 5.15 overlay (drops MoE fields).
+    os.environ["PYTHONPATH"] = sglang_pythonpath(hook_dir=_SGLANG_RUNTIME_HOOKS)
     os.environ.pop("PYTORCH_ALLOC_CONF", None)
 
     if getattr(server_args, "encoder_only", False):

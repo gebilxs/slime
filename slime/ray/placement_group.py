@@ -44,7 +44,14 @@ def _create_placement_group(num_gpus):
     if num_gpus == 0:
         return None, [], []
 
-    bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
+    # Optional node pin: SLIME_PIN_NODE=<ip> forces every bundle onto that node
+    # (raylets auto-advertise a node:<ip> resource). Used by single-pod lanes on
+    # a shared multi-node cluster; empty = stock node-blind PACK behavior.
+    import os
+
+    pin = os.environ.get("SLIME_PIN_NODE", "").strip()
+    pin_res = {f"node:{pin}": 0.001} if pin else {}
+    bundles = [{"GPU": 1, "CPU": 1, **pin_res} for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
 
