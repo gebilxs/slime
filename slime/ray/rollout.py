@@ -27,7 +27,7 @@ from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_inf
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
-from slime.utils.env_pack import ENV_LOSS_BATCH_KEYS, pack_world_loss_fields
+from slime.utils.rollout_extras import extra_passthrough_keys, extra_tensor_dtypes, pack_extras
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
@@ -42,16 +42,11 @@ logger = logging.getLogger(__name__)
 _ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": torch.long,
     "loss_masks": torch.int,
-    "world_loss_masks": torch.int,
-    "echo_full_obs_counts": torch.float32,
     "rollout_log_probs": torch.float32,
     "rollout_top_p_token_ids": torch.int32,
     "rollout_top_p_token_offsets": torch.int32,
     "teacher_log_probs": torch.float32,
     "rollout_routed_experts": None,
-    # ECHO turn-level GRPO (protocols.echo_xml.turn_adv): per-token advantages,
-    # one response-length list per sample. Present only when ECHO_TURN_ADV=1.
-    "turn_token_advantages": torch.float32,
 }
 
 _SGLANG_REQUEST_PERF_FIELDS = (
@@ -85,8 +80,10 @@ def _cpu_tensor(value, dtype: torch.dtype | None = None) -> torch.Tensor:
     return tensor.detach().cpu().contiguous()
 
 
-def _tensorize_rollout_data_for_training(rollout_data: dict[str, Any]) -> None:
-    for key, dtype in _ROLLOUT_DATA_TENSOR_DTYPES.items():
+def _tensorize_rollout_data_for_training(
+    rollout_data: dict[str, Any], extra_dtypes: dict | None = None
+) -> None:
+    for key, dtype in {**_ROLLOUT_DATA_TENSOR_DTYPES, **(extra_dtypes or {})}.items():
         if key in rollout_data:
             rollout_data[key] = [_cpu_tensor(value, dtype=dtype) for value in rollout_data[key]]
 
@@ -811,9 +808,9 @@ class RolloutManager:
             loss_masks.append(sample.loss_mask)
         train_data["loss_masks"] = loss_masks
 
-        packed_env = pack_world_loss_fields(samples)
-        if packed_env:
-            train_data.update(packed_env)
+        packed_extras = pack_extras(self.args, samples)
+        if packed_extras:
+            train_data.update(packed_extras)
 
         # Per-rollout aggregate, precomputed at the step level (where we can
         # see every sample of every rollout) and broadcast per-sample so the
@@ -923,7 +920,7 @@ class RolloutManager:
                 "rewards",
                 "truncated",
                 "loss_masks",
-                *ENV_LOSS_BATCH_KEYS,
+                *extra_passthrough_keys(self.args),
                 "round_number",
                 "sample_indices",
                 "rollout_ids",
@@ -935,9 +932,6 @@ class RolloutManager:
                 "source_names",
                 "prompt",
                 "teacher_log_probs",
-                # ECHO turn-level GRPO (protocols.echo_xml.turn_adv); only in
-                # data when ECHO_TURN_ADV=1, so the default path is untouched.
-                "turn_token_advantages",
             ]:
                 if key not in data:
                     continue
@@ -950,7 +944,9 @@ class RolloutManager:
             rollout_data["global_batch_sizes"] = global_batch_sizes
             rollout_data["num_microbatches"] = num_microbatches
             rollout_data["micro_batch_indices"] = micro_batch_indices[r]
-            _tensorize_rollout_data_for_training(rollout_data)
+            _tensorize_rollout_data_for_training(
+                rollout_data, extra_dtypes=extra_tensor_dtypes(self.args)
+            )
             transport = getattr(self.args, "rollout_data_transport", "object-store")
             if transport == "nixl":
                 rollout_data_refs.append(Box(ray.put(rollout_data, _tensor_transport="nixl")))

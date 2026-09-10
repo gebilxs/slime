@@ -29,8 +29,8 @@ try:
 except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.utils import logging_utils
-from slime.utils.env_pack import ENV_LOSS_BATCH_KEYS
 from slime.utils.memory_utils import clear_memory
+from slime.utils.rollout_extras import extra_batch_keys
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
@@ -597,7 +597,10 @@ def train_one_step(
                     "rollout_log_probs",
                     "teacher_log_probs",
                     "rollout_mask_sums",
-                    *ENV_LOSS_BATCH_KEYS,
+                    # Extra keys contributed by a plugin (--rollout-extras-path).
+                    # Omitting them here silently starves the plugin's loss term:
+                    # it reads the batch, finds nothing, and contributes zero.
+                    *extra_batch_keys(args),
                     # Only present when dumping train debug data; lets the loss
                     # snapshot each sample's log_probs keyed by rollout position.
                     *(["partition"] if args.save_debug_train_data is not None else []),

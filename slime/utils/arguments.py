@@ -955,6 +955,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--extra-loss-function-path",
+                type=str,
+                default=None,
+                help=(
+                    "Optional additive loss term applied on top of the selected loss "
+                    "(unlike --custom-loss-function-path, which replaces it). Signature: "
+                    "`fn(loss, log_probs, batch, args, *, slice_cp, total_lengths, "
+                    "response_lengths) -> (loss, metrics)`. Metrics are merged into the "
+                    "reported loss dict. No-op when unset."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-extras-path",
+                type=str,
+                default=None,
+                help=(
+                    "Optional provider of extra rollout tensors, so plugins can add "
+                    "fields to the rollout -> train hand-off without editing core. "
+                    "Resolves to an object exposing `TENSOR_DTYPES` (name -> torch "
+                    "dtype), `BATCH_KEYS` / `PASSTHROUGH_KEYS` (tuples of str), and "
+                    "`pack(samples) -> dict | None`. No-op when unset."
+                ),
+            )
+            parser.add_argument(
                 "--kl-loss-type",
                 type=str,
                 choices=["k1", "k2", "k3", "low_var_kl"],

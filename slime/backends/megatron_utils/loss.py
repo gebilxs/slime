@@ -9,7 +9,6 @@ from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
-from slime.utils.env_loss import apply_env_loss
 from slime.utils.misc import load_function
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
@@ -1136,19 +1135,21 @@ def policy_loss_function(
 
         loss = loss + args.kl_loss_coef * kl_loss
 
-    # Additive L_Env on observation tokens (orthogonal to the GRPO mask).
-    # 0805 Megatron train get_batch omitted world_loss_masks, so this term
-    # never reached the GPU; batch keys are in model.py via ENV_LOSS_BATCH_KEYS.
-    slice_cp = slice_log_prob_with_cp if mpu.get_context_parallel_world_size() > 1 else None
-    loss, env_metrics = apply_env_loss(
-        loss,
-        log_probs,
-        batch,
-        args,
-        slice_cp=slice_cp,
-        total_lengths=total_lengths,
-        response_lengths=response_lengths,
-    )
+    # Optional additive loss term from a plugin (--extra-loss-function-path),
+    # applied on top of the policy loss rather than replacing it. Needs
+    # log_probs, which only exists inside this function, hence the hook here.
+    extra_metrics: dict = {}
+    if getattr(args, "extra_loss_function_path", None):
+        slice_cp = slice_log_prob_with_cp if mpu.get_context_parallel_world_size() > 1 else None
+        loss, extra_metrics = load_function(args.extra_loss_function_path)(
+            loss,
+            log_probs,
+            batch,
+            args,
+            slice_cp=slice_cp,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+        )
 
     # make sure the gradient could backprop correctly.
     if log_probs.numel() == 0:
@@ -1167,7 +1168,7 @@ def policy_loss_function(
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }
-    for key, value in env_metrics.items():
+    for key, value in extra_metrics.items():
         if value is None:
             continue
         reported_loss[key] = value.clone().detach() if torch.is_tensor(value) else value
