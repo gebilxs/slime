@@ -17,7 +17,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 from slime.backends.sglang_utils.external import start_external_rollout_servers
 from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
-from slime.rollout.base_types import call_rollout_fn
+from slime.rollout.base_types import call_rollout_fn, shutdown_rollout_fn
 from slime.rollout.sample_hooks import set_current_rollout_id
 from slime.utils import logging_utils
 from slime.utils.data import get_source
@@ -555,6 +555,11 @@ class RolloutManager:
     def dispose(self):
         for monitor in self._health_monitors:
             monitor.stop()
+        # Let the rollout function cancel in-flight generations and destroy
+        # their sandboxes while this actor is still alive. Ray's teardown after
+        # dispose() is a hard kill (no atexit, no finally): on 2026-09-14 a run
+        # that ended normally left one orphan container per in-flight episode.
+        shutdown_rollout_fn(self.generate_rollout)
         logging_utils.finish_tracking(self.args)
 
     @property
@@ -714,9 +719,15 @@ class RolloutManager:
 
     def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
         # TODO to be refactored (originally Buffer._set_data)
-        if (path_template := self.args.save_debug_rollout_data) is not None:
-            path = Path(path_template.format(rollout_id=("eval_" if evaluation else "") + str(rollout_id)))
-            logger.info(f"Save debug rollout data to {path}")
+        if (path_template := self.args.save_debug_rollout_data) is None:
+            return
+        path = Path(path_template.format(rollout_id=("eval_" if evaluation else "") + str(rollout_id)))
+        logger.info(f"Save debug rollout data to {path}")
+        # The dump is optional diagnostics but runs *before* the rollout / eval
+        # log hooks. If it raised, a finished rollout would be thrown away
+        # (2026-09-14: a dangling symlink made mkdir(exist_ok=True) raise
+        # FileExistsError and a completed eval lost all its scores). Warn instead.
+        try:
             path.parent.mkdir(parents=True, exist_ok=True)
 
             # TODO may improve the format
@@ -730,6 +741,8 @@ class RolloutManager:
                 )
 
             torch.save(dict(rollout_id=rollout_id, **dump_data), path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Skipping debug rollout dump to {path}: {type(e).__name__}: {e}")
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
         if self.custom_reward_post_process_func is not None:

@@ -182,6 +182,92 @@ def test_done_callback_never_blocks_event_loop_thread(monkeypatch):
 
 
 @pytest.mark.unit
+def test_stop_cancels_inflight_tasks_and_runs_their_cleanup(monkeypatch):
+    """stop() must cancel in-flight generations so each one's ``finally``
+    (env.close → sandbox /destroy) runs before the thread exits. The old
+    "wait for them to finish" drain never got there: an episode needs
+    minutes, the process exited in seconds, one container leaked per task
+    (50 on two pods, 2026-09-14)."""
+    concurrency = 4
+    data_buffer = _FakeDataBuffer([_make_group(i) for i in range(50)])
+    started = threading.Event()
+    n_started = 0
+    closed: list[int] = []
+    lock = threading.Lock()
+
+    async def _hanging_generate(args, group, sampling_params, evaluation):
+        nonlocal n_started
+        with lock:
+            n_started += 1
+            if n_started >= concurrency:
+                started.set()
+        try:
+            await asyncio.sleep(3600)  # a "long episode"
+        finally:
+            closed.append(group[0].index)  # env.close() stand-in
+        return group
+
+    monkeypatch.setattr(fa, "generate_and_rm_group", _hanging_generate)
+    worker = _make_worker(monkeypatch, data_buffer=data_buffer, concurrency=concurrency)
+    worker.poll_interval = 0.01
+    worker.DRAIN_TIMEOUT_S = 5.0
+
+    worker.start()
+    assert started.wait(timeout=5), "worker never filled its in-flight pool"
+    t0 = time.time()
+    worker.stop()
+    elapsed = time.time() - t0
+
+    assert not worker.worker_thread.is_alive(), "worker thread still alive after stop()"
+    assert sorted(closed) == list(range(concurrency)), closed
+    assert elapsed < 5.0, f"stop() took {elapsed:.1f}s; cancel path should be near-instant"
+    # Cancelled groups are neither shipped nor requeued.
+    assert worker.queue_size() == 0
+    assert data_buffer.requeued == []
+    # Intake is closed, so a late loop iteration cannot start new work.
+    assert worker.accepting is False and worker.running is False
+
+
+@pytest.mark.unit
+def test_done_callback_swallows_cancelled_task(monkeypatch):
+    """A cancelled task must not raise out of the loop-thread callback."""
+    worker = _make_worker(monkeypatch)
+
+    class _CancelledTask:
+        def result(self):
+            raise asyncio.CancelledError()
+
+    worker._active_count = 1
+    worker._make_done_cb(0)(_CancelledTask())
+    assert worker._active_count == 0
+    assert worker.queue_size() == 0
+
+
+@pytest.mark.unit
+def test_shutdown_rollout_seam_stops_global_worker(monkeypatch):
+    """RolloutManager.dispose reaches the worker through
+    ``base_types.shutdown_rollout_fn`` → module ``shutdown_rollout``."""
+    from slime.rollout import base_types
+
+    calls: list[str] = []
+
+    class _W:
+        def stop(self):
+            calls.append("stop")
+
+    monkeypatch.setattr(fa, "_global_worker", _W())
+    assert base_types.shutdown_rollout_fn(fa.generate_rollout_fully_async) is True
+    assert calls == ["stop"]
+    assert fa._global_worker is None
+
+    # A rollout function whose module has no hook is a no-op, not an error.
+    def _plain_fn(*a, **k):
+        return None
+
+    assert base_types.shutdown_rollout_fn(_plain_fn) is False
+
+
+@pytest.mark.unit
 def test_loop_backpressure_stops_topping_up_when_queue_is_full(monkeypatch):
     """With instantly-completing generations and plenty of fuel, the queue must
     plateau around ``concurrency`` instead of absorbing the whole dataset."""

@@ -241,25 +241,33 @@ async def generate_and_rm(
 
     state = GenerateState(args)
 
-    # generate
-    async with state.semaphore:
+    custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+    custom_generate_func = load_function(custom_func_path) if custom_func_path else None
+    # Opt-in: the plugin acquires GenerateState.semaphore around each SGLang
+    # call (typically one turn). Holding it here would stall decode for the
+    # whole agent episode, including docker exec. Default generate and
+    # generate_streaming keep the episode-scoped permit below.
+    owns_sem = bool(custom_generate_func is not None and getattr(custom_generate_func, "owns_sglang_semaphore", False))
+
+    async def _call_generate():
+        if custom_generate_func is not None:
+            if "evaluation" in inspect.signature(custom_generate_func).parameters:
+                return await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
+            return await custom_generate_func(args, sample, sampling_params)
+        return await generate(args, sample, sampling_params)
+
+    if owns_sem:
         if state.aborted:
             sample.status = Sample.Status.ABORTED
             return sample
-
-        with state.dp_rank_context() as _:
-            # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
-            custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
-
-            if custom_func_path is not None:
-                custom_generate_func = load_function(custom_func_path)
-                # if signature has evaluation, pass evaluation
-                if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                    sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
-                else:
-                    sample = await custom_generate_func(args, sample, sampling_params)
-            else:
-                sample = await generate(args, sample, sampling_params)
+        sample = await _call_generate()
+    else:
+        async with state.semaphore:
+            if state.aborted:
+                sample.status = Sample.Status.ABORTED
+                return sample
+            with state.dp_rank_context() as _:
+                sample = await _call_generate()
 
     sample = await apply_rollout_sample_hooks(args, sample, evaluation=evaluation)
 

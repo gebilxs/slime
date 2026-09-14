@@ -65,6 +65,7 @@ from slime.utils.types import Sample
 __all__ = [
     "AsyncRolloutWorker",
     "generate_rollout_fully_async",
+    "shutdown_rollout",
 ]
 
 logger = logging.getLogger("slime.rollout.fully_async")
@@ -204,6 +205,19 @@ def _stop_global_worker() -> None:
             _global_worker = None
 
 
+def shutdown_rollout() -> None:
+    """Release everything the worker holds: cancel in-flight generations so
+    each episode's ``finally`` (env.close → sandbox ``/destroy``) runs.
+
+    ``RolloutManager.dispose`` calls this through the ``shutdown_rollout``
+    seam while the actor is still alive. Ray's teardown right after is a hard
+    kill -- no ``atexit``, no ``finally`` -- which is how a run that ended
+    normally on 2026-09-14 left 50 ``sleep infinity`` containers behind, one
+    per in-flight episode.
+    """
+    _stop_global_worker()
+
+
 atexit.register(_stop_global_worker)
 
 
@@ -238,10 +252,23 @@ class AsyncRolloutWorker:
             self.worker_thread = threading.Thread(target=self._thread_main, name="fully-async-rollout", daemon=True)
             self.worker_thread.start()
 
-    def stop(self) -> None:
+    # Shutdown budget. Cancelling an in-flight task fires its ``finally``
+    # (env.close → one ``/destroy`` HTTP call), so the drain takes seconds,
+    # not the minutes a generation would need to run to completion.
+    DRAIN_TIMEOUT_S = 20.0
+
+    def stop(self, timeout: float | None = None) -> None:
+        """Stop intake, cancel in-flight generations, wait for their cleanup.
+
+        The old version only waited for in-flight tasks to *finish* (30 s in
+        the loop, 5 s here): an episode needs minutes, so the process exited
+        first and no ``finally: env.close()`` ever ran -- one leaked sandbox
+        container per in-flight episode.
+        """
+        self.accepting = False
         self.running = False
         if self.worker_thread and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=5)
+            self.worker_thread.join(timeout=self.DRAIN_TIMEOUT_S + 5.0 if timeout is None else timeout)
 
     def get_completed_groups(self, limit: int | None = None) -> list[tuple[int, list[Sample]]]:
         """Pop up to ``limit`` completed groups (all of them when ``None``).
@@ -292,6 +319,8 @@ class AsyncRolloutWorker:
                     for t in done:
                         try:
                             t.result()  # results already handled in callback
+                        except asyncio.CancelledError:
+                            pass
                         except Exception as e:  # noqa: BLE001
                             logger.warning("fully-async task crashed: %r", e)
                     active_tasks -= done
@@ -328,14 +357,24 @@ class AsyncRolloutWorker:
                 await asyncio.sleep(self.poll_interval)
 
         if active_tasks:
+            # Cancel, don't wait: CancelledError lands at each task's current
+            # await, its ``finally`` closes the sandbox, and the task ends.
             logger.info(
-                "fully-async: waiting for %d in-flight tasks to drain",
+                "fully-async: cancelling %d in-flight tasks so their sandboxes close",
                 len(active_tasks),
             )
+            for t in active_tasks:
+                t.cancel()
             try:
-                await asyncio.wait(active_tasks, timeout=30)
+                _, pending = await asyncio.wait(active_tasks, timeout=self.DRAIN_TIMEOUT_S)
             except Exception:  # noqa: BLE001
-                pass
+                pending = set()
+            if pending:
+                logger.warning(
+                    "fully-async: %d in-flight tasks did not finish cleanup within %.0fs",
+                    len(pending),
+                    self.DRAIN_TIMEOUT_S,
+                )
 
     def _make_done_cb(self, gid: int):
         def _cb(done_task: asyncio.Task) -> None:
@@ -344,6 +383,9 @@ class AsyncRolloutWorker:
                 self._active_condition.notify_all()
             try:
                 result = done_task.result()
+            except asyncio.CancelledError:
+                # Shutdown path: the group is neither shipped nor requeued.
+                return
             except Exception:  # noqa: BLE001
                 logger.exception("fully-async: process task raised")
                 return

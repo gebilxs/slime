@@ -197,5 +197,75 @@ def test_generate_and_rm_group_rm_accepts_list_result_from_custom_generate(patch
     assert all(isinstance(sample, Sample) for sample in result)
 
 
+def test_owns_sglang_semaphore_skips_outer_permit(patch_generate_state, monkeypatch):
+    sglang_rollout = patch_generate_state
+    entered: list[int] = []
+
+    class CountingSem:
+        async def __aenter__(self):
+            entered.append(1)
+
+        async def __aexit__(self, exc_type, exc, tb):
+            entered.append(0)
+            return False
+
+    class CountingState(_PatchedGenerateState):
+        def __init__(self, args):
+            super().__init__(args)
+            self.semaphore = CountingSem()
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", CountingState)
+
+    async def custom_owns(args, sample: Sample, sampling_params: dict):
+        assert entered == []
+        sample.tokens = [1]
+        sample.response = "x"
+        sample.response_length = 1
+        sample.reward = 1.0
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    custom_owns.owns_sglang_semaphore = True
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda _path: custom_owns)
+    result = asyncio.run(
+        generate_and_rm(
+            make_args(custom_generate_function_path="plugin_contracts.fake_generate"),
+            Sample(index=0, prompt="prompt"),
+            sampling_params={"temperature": 0.3},
+        )
+    )
+    assert_sample_contract(result)
+    assert entered == []
+
+
+def test_custom_generate_without_flag_still_holds_outer_permit(patch_generate_state, monkeypatch):
+    sglang_rollout = patch_generate_state
+    entered: list[int] = []
+
+    class CountingSem:
+        async def __aenter__(self):
+            entered.append(1)
+
+        async def __aexit__(self, exc_type, exc, tb):
+            entered.append(0)
+            return False
+
+    class CountingState(_PatchedGenerateState):
+        def __init__(self, args):
+            super().__init__(args)
+            self.semaphore = CountingSem()
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", CountingState)
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda _path: custom_generate)
+    asyncio.run(
+        generate_and_rm(
+            make_args(custom_generate_function_path=REFERENCE_CUSTOM_GENERATE_PATH),
+            Sample(index=0, prompt="prompt"),
+            sampling_params={"temperature": 0.3},
+        )
+    )
+    assert entered == [1, 0]
+
+
 if __name__ == "__main__":
     run_contract_test_file()
